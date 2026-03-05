@@ -33,9 +33,6 @@ REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
 TEXT_MODEL = "gpt-5.2"
 
-audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2000)
-translation_jobs: "queue.Queue[tuple[int, str]]" = queue.Queue(maxsize=2000)
-
 app = FastAPI()
 
 
@@ -74,7 +71,6 @@ def pcm16_b64(x_float32: np.ndarray) -> str:
 
 
 def normalize_newlines(s: str) -> str:
-    # Some payloads can contain literal "\n"
     return (s or "").replace("\\n", "\n")
 
 
@@ -124,7 +120,7 @@ def summarize_turns(turns: List[Dict[str, str]], summary_lang: str, meeting_cont
 
 
 # =========================
-# UI
+# UI  (unchanged)
 # =========================
 INDEX_HTML = r"""
 <!doctype html>
@@ -146,7 +142,6 @@ INDEX_HTML = r"""
 
     .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:8px; }
 
-    /* Paired history table */
     .history {
       height: 66vh;
       overflow: auto;
@@ -185,7 +180,6 @@ INDEX_HTML = r"""
       font-style: italic;
     }
 
-    /* Summary full-width */
     .summaryBox {
       font-family: inherit;
       font-size: 12px;
@@ -272,7 +266,7 @@ INDEX_HTML = r"""
     order: [],
     srcById: {},
     trById: {},
-    rowEls: {} // id -> {srcEl, trEl}
+    rowEls: {}
   };
 
   function makeRow(id) {
@@ -406,18 +400,25 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     loop = asyncio.get_running_loop()
 
-    state: Dict[str, Any] = {
+    # FIX 2: All mutable state is now local to this connection — no globals shared across sessions
+    session_state: Dict[str, Any] = {
         "settings": {
             "asrLang": "auto",
             "translateTo": "es",
             "summaryLang": "en",
         },
         "meeting_context": "",
-        "turns": [],  # [{id, src, translation}]
+        "turns": [],
     }
 
-    # server -> browser queue
-    send_q: asyncio.Queue[str] = asyncio.Queue()
+    # FIX 2: Per-session queues (were global before — two tabs would mix audio/jobs)
+    audio_q: queue.Queue = queue.Queue(maxsize=2000)
+    translation_jobs: queue.Queue = queue.Queue(maxsize=2000)
+
+    # FIX 3: Shutdown event to cleanly stop worker threads when the WS closes
+    shutdown_event = threading.Event()
+
+    send_q: asyncio.Queue = asyncio.Queue()
 
     async def sender():
         while True:
@@ -430,7 +431,6 @@ async def ws_endpoint(ws: WebSocket):
         s = json.dumps(payload, ensure_ascii=False)
         asyncio.run_coroutine_threadsafe(send_q.put(s), loop)
 
-    # pick audio input device (BlackHole preferred)
     try:
         device_index = pick_blackhole_device_index()
     except Exception as e:
@@ -443,33 +443,40 @@ async def ws_endpoint(ws: WebSocket):
         "text": f"Using input device index {device_index}. Route Meet/Teams audio to Multi-Output incl. BlackHole."
     }))
 
-    # Turn IDs
     turn_counter_box = {"v": 0}
-    counter_lock = threading.Lock()
 
-    # Translation worker (async)
+    # FIX 4: Lock protecting both turn_counter_box AND session_state["turns"]
+    # so the translation thread and asyncio loop never write simultaneously
+    turns_lock = threading.Lock()
+
     def translation_worker():
-        while True:
-            tid, txt = translation_jobs.get()
+        # FIX 3: Loop exits cleanly when shutdown_event is set
+        while not shutdown_event.is_set():
+            try:
+                tid, txt = translation_jobs.get(timeout=1.0)
+            except queue.Empty:
+                continue  # re-check shutdown_event
+
             try:
                 tr = translate_text(
                     text_src=txt,
-                    translate_to=state["settings"].get("translateTo", "es"),
-                    meeting_context=state["meeting_context"]
+                    translate_to=session_state["settings"].get("translateTo", "es"),
+                    meeting_context=session_state["meeting_context"]
                 )
             except Exception as e:
                 tr = f"[Translation error: {e}]"
 
-            for t in reversed(state["turns"]):
-                if t.get("id") == tid:
-                    t["translation"] = tr
-                    break
+            # FIX 4: Lock when writing back to shared turns list
+            with turns_lock:
+                for t in reversed(session_state["turns"]):
+                    if t.get("id") == tid:
+                        t["translation"] = tr
+                        break
 
             send_from_thread({"type": "translation", "id": tid, "translation": tr})
 
     threading.Thread(target=translation_worker, daemon=True).start()
 
-    # Realtime transcription websocket
     headers = [f"Authorization: Bearer {OPENAI_API_KEY}"]
     current_item = {"item_id": None, "text": ""}
 
@@ -477,7 +484,7 @@ async def ws_endpoint(ws: WebSocket):
         rtws.send(json.dumps(obj))
 
     def configure_transcription_session(rtws):
-        lang = state["settings"].get("asrLang", "auto")
+        lang = session_state["settings"].get("asrLang", "auto")
         transcription_obj = {"model": TRANSCRIBE_MODEL}
         if lang != "auto":
             transcription_obj["language"] = lang
@@ -516,6 +523,7 @@ async def ws_endpoint(ws: WebSocket):
                     pass
 
         def audio_thread():
+            # FIX 3: Audio thread also respects shutdown_event
             with sd.InputStream(
                 device=device_index,
                 channels=1,
@@ -523,8 +531,11 @@ async def ws_endpoint(ws: WebSocket):
                 blocksize=CHUNK_SAMPLES,
                 callback=audio_callback,
             ):
-                while True:
-                    chunk = audio_q.get()
+                while not shutdown_event.is_set():
+                    try:
+                        chunk = audio_q.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
                     rt_send(rtws, {"type": "input_audio_buffer.append", "audio": pcm16_b64(chunk)})
 
         threading.Thread(target=audio_thread, daemon=True).start()
@@ -534,7 +545,6 @@ async def ws_endpoint(ws: WebSocket):
         t = data.get("type", "")
 
         if t == "conversation.item.input_audio_transcription.delta":
-            # We no longer render "live" in UI; do nothing
             return
 
         if t == "conversation.item.input_audio_transcription.completed":
@@ -542,12 +552,12 @@ async def ws_endpoint(ws: WebSocket):
             if not transcript:
                 return
 
-            with counter_lock:
+            # FIX 4: Lock when writing to shared turns list
+            with turns_lock:
                 turn_counter_box["v"] += 1
                 tid = turn_counter_box["v"]
+                session_state["turns"].append({"id": tid, "src": transcript, "translation": ""})
 
-            # Send turn immediately (translation will follow)
-            state["turns"].append({"id": tid, "src": transcript, "translation": ""})
             send_from_thread({"type": "turn", "id": tid, "src": transcript, "translation": ""})
 
             try:
@@ -555,10 +565,8 @@ async def ws_endpoint(ws: WebSocket):
             except queue.Full:
                 send_from_thread({"type": "translation", "id": tid, "translation": "[Translation queue full]"})
 
-
     def on_error(rtws, err):
         send_from_thread({"type": "status", "text": f"Realtime error: {err}"})
-
 
     rtws = websocket.WebSocketApp(
         REALTIME_URL,
@@ -569,7 +577,6 @@ async def ws_endpoint(ws: WebSocket):
     )
     threading.Thread(target=rtws.run_forever, daemon=True).start()
 
-    # UI commands
     try:
         while True:
             incoming = await ws.receive_text()
@@ -581,9 +588,9 @@ async def ws_endpoint(ws: WebSocket):
                 if isinstance(new, dict):
                     for k in ["asrLang", "translateTo", "summaryLang"]:
                         if k in new:
-                            state["settings"][k] = str(new[k])
+                            session_state["settings"][k] = str(new[k])
 
-                    await ws.send_text(json.dumps({"type": "status", "text": f"Settings updated: {state['settings']}"}))
+                    await ws.send_text(json.dumps({"type": "status", "text": f"Settings updated: {session_state['settings']}"}))
                     try:
                         configure_transcription_session(rtws)
                     except Exception:
@@ -592,29 +599,34 @@ async def ws_endpoint(ws: WebSocket):
             elif mtype == "context":
                 ctx = msg.get("context", "")
                 if isinstance(ctx, str):
-                    state["meeting_context"] = ctx.strip()
+                    session_state["meeting_context"] = ctx.strip()
                     await ws.send_text(json.dumps({"type": "status", "text": "Context set ✅ (ES/EN ok)"}))
 
             elif mtype == "summary_request":
-                if not state["turns"]:
+                # FIX 4: Lock when reading turns for summary
+                with turns_lock:
+                    turns_snapshot = list(session_state["turns"])
+
+                if not turns_snapshot:
                     await ws.send_text(json.dumps({"type": "summary", "text": "No turns captured yet."}))
                 else:
                     try:
                         out = summarize_turns(
-                            turns=state["turns"],
-                            summary_lang=state["settings"].get("summaryLang", "en"),
-                            meeting_context=state["meeting_context"]
+                            turns=turns_snapshot,
+                            summary_lang=session_state["settings"].get("summaryLang", "en"),
+                            meeting_context=session_state["meeting_context"]
                         )
                         await ws.send_text(json.dumps({"type": "summary", "text": out}))
                     except Exception as e:
                         await ws.send_text(json.dumps({"type": "summary", "text": f"Summary error: {e}"}))
 
             elif mtype == "clear":
-                state["turns"] = []
+                # FIX 4: Lock when clearing turns
+                with turns_lock:
+                    session_state["turns"] = []
                 current_item["item_id"] = None
                 current_item["text"] = ""
 
-                # Clear queued translation jobs (best effort)
                 try:
                     while True:
                         translation_jobs.get_nowait()
@@ -626,6 +638,12 @@ async def ws_endpoint(ws: WebSocket):
     except Exception:
         pass
     finally:
+        # FIX 3: Signal all threads to stop cleanly when this WS session ends
+        shutdown_event.set()
+        try:
+            rtws.close()
+        except Exception:
+            pass
         try:
             sender_task.cancel()
         except Exception:
